@@ -101,7 +101,7 @@ Kernel aliases (clinically equivalent):
 
 **Example:**
 ```
-changyong_dataset/
+dataset/
 ├── train/
 │   └── WBCT_Chest/
 │       ├── Quarter/
@@ -339,10 +339,3 @@ sbatch train.sh
 The SBATCH wrapper launches a Docker container and executes `scripts/run_train.sh` internally. Edit the active `python train.py` command in `scripts/run_train.sh` to select the desired ablation step.
 
 ---
-
-## References
-
-- **I2SB**: Liu et al., "I²SB: Image-to-Image Schrödinger Bridge" (ICML 2023)
-- **PixelDiT**: Luo et al., "Pixel-level and Patch-level DiT for High-resolution Image Generation" (2024)
-- **REPA**: Stabilizing representation learning for diffusion models via DINOv2 feature alignment
-- **DINOv2**: Oquab et al., "DINOv2: Learning Robust Visual Features without Supervision" (2023)
