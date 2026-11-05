@@ -9,9 +9,9 @@
 # ============================================================
 
 DATASET_DIR="/workspace/changyong/07.LDCT2NDCT/data/changyong_dataset"
-CKPT_NAME="step2_i2sb_repa_base_RTX3090"
-LOAD_ITR=200000
-NFE=10
+CKPT_NAME="step4_i2sb_fd_base_cross_noise_RTX3090"
+LOAD_ITR=250000
+NFE=2
 
 # ---------------------------------------------------------------
 # Sample: all 9 default pairs (I2SB DDPM)

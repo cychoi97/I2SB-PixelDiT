@@ -14,14 +14,16 @@
 #   (Quarter,B60f) → (Quarter,B30f)   kernel conversion
 #   (Quarter,B60f) → (Quarter,B45f)   kernel conversion
 #   (Quarter,B30f) → (Full,B30f)      denoising
+#   (Quarter,B45f) → (Full,B45f)      densising
+#   (Quarter,B60f) → (Full,B60f)      densising
 #
 # PixelDiT architecture:
-#   patch-level depth N: 12 (base), 18 (medium), 22 (large), 26 (xlarge)
-#   pixel-level depth M: 2 (base), 4 (medium), 4 (large), 4 (xlarge)
-#   hidden-size D: 768 (base), 896 (medium), 1024 (large), 1152 (xlarge)
-#   num groups G: 12 (base), 14 (medium), 16 (large), 16 (xlarge)
-#   pixel hidden size D_pix: 16 (base), 16 (medium), 16 (large), 16 (xlarge)
-#   patch size: 16 (base), 16 (medium), 16 (large), 16 (xlarge)
+#   patch-level depth N: 12 (base), 22 (large), 26 (xlarge)
+#   pixel-level depth M: 2 (base), 4 (large), 4 (xlarge)
+#   hidden-size D: 768 (base), 1024 (large), 1152 (xlarge)
+#   num groups G: 12 (base), 16 (large), 16 (xlarge)
+#   pixel hidden size D_pix: 16 (base), 16 (large), 16 (xlarge)
+#   patch size: 16 (base), 16 (large), 16 (xlarge)
 # ============================================================
 
 GPU_NAME="RTX3090"
@@ -48,17 +50,17 @@ ABLATION_COMMON="\
     --clip-denoise \
     --cond-x1 \
     --batch-size         64 \
-    --microbatch         4 \
+    --microbatch         1 \
     --num-itr            200000 \
     --lr                 1e-4 \
     --lr-gamma           0.99 \
     --lr-step            1000 \
     --ema                0.99 \
-    --hidden-size        768 \
+    --hidden-size        1024 \
     --pixel-hidden-size  16 \
-    --patch-depth        12 \
-    --pixel-depth        2 \
-    --num-groups         12 \
+    --patch-depth        22 \
+    --pixel-depth        4 \
+    --num-groups         16 \
     --patch-size         16"
 
 # ---------------------------------------------------------------
@@ -69,52 +71,96 @@ ABLATION_COMMON="\
 #     --master-port        4571 \
 #     --embedding-mode     base \
 #     --feat-loss-weight   0.0 \
-#     --name               step1_i2sb_base_${GPU_NAME} \
-#     --ckpt               step1_i2sb_base_${GPU_NAME} \
-#     --start-itr          175000
+#     --name               step1_PixelDiT-L_i2sb_base_${GPU_NAME} \
+#     --ckpt               step1_PixelDiT-L_i2sb_base_${GPU_NAME} \
+#     --start-itr          60000
 
 # ---------------------------------------------------------------
-# Step 2: + REPA loss (I2SB + DINOv2 feature alignment)
+# Step 2: + Cross embedding (without REPA loss)
 # ---------------------------------------------------------------
 python train.py \
     ${ABLATION_COMMON} \
     --master-port        4572 \
-    --embedding-mode     base \
-    --feat-loss-weight   0.5 \
-    --feat-loss-interval 1 \
+    --embedding-mode     base_cross \
+    --feat-loss-weight   0.0 \
     --dino-model         dinov2_vitb14 \
-    --align-layer        8 \
-    --name               step2_i2sb_repa_base_${GPU_NAME} \
-    --ckpt               step2_i2sb_repa_base_${GPU_NAME} \
-    --start-itr          185000
+    --name               step2_PixelDiT-L_i2sb_base_cross_${GPU_NAME} \
+    --ckpt               step2_PixelDiT-L_i2sb_base_cross_${GPU_NAME} \
+    --start-itr          60000
 
 # ---------------------------------------------------------------
-# Step 3: + Cross embedding (I2SB + REPA + base_cross embedding)
+# Step 3: + Noise adaptive embedding (I2SB + base_cross_noise)
 # ---------------------------------------------------------------
 # python train.py \
 #     ${ABLATION_COMMON} \
 #     --master-port        4573 \
-#     --embedding-mode     base_cross \
-#     --feat-loss-weight   0.5 \
-#     --feat-loss-interval 1 \
+#     --embedding-mode     base_cross_noise \
+#     --noise-feat-dim     20 \
+#     --feat-loss-weight   0.0 \
 #     --dino-model         dinov2_vitb14 \
-#     --align-layer        8 \
-#     --name               step3_i2sb_repa_base_cross_${GPU_NAME} \
-#     --ckpt               step3_i2sb_repa_base_cross_${GPU_NAME} \
-#     --start-itr          180000
+#     --name               step3_i2sb_base_cross_noise_${GPU_NAME} \
+#     --ckpt               step3_i2sb_base_cross_noise_${GPU_NAME} \
+#     --start-itr          160000
+
+# ================================================================
+# [PREREQUISITE] Compute FD-Loss reference statistics (run ONCE)
+# ================================================================
+# Compute reference statistics for all 5 target domains in a single pass:
+#   - Full_B30f, Full_B45f, Full_B60f, Quarter_B30f, Quarter_B45f
+#
+# Single GPU:
+# python compute_fd_stats.py \
+#     --dataset-dir ${DATASET_DIR} \
+#     --split       train \
+#     --dino-model  dinov2_vitb14 \
+#     --output      data/fd_stats/target_5domains_dinov2b14.npz
+
+# Multi-GPU (torchrun):
+#   torchrun --nproc_per_node=2 compute_fd_stats.py \
+#       --dataset-dir ${DATASET_DIR} \
+#       --split       train \
+#       --dino-model  dinov2_vitb14 \
+#       --output      data/fd_stats/target_5domains_dinov2b14.npz
 
 # ---------------------------------------------------------------
-# Step 4: + Noise adaptive embedding (I2SB + REPA + base_cross_noise)
+# Step 4: + Target-Conditioned FD-Loss (I2SB + base_cross_noise, NO REPA)
+#   - REPA is disabled (--feat-loss-weight 0.0) to preserve PSNR/SSIM
+#   - Target-Conditioned FD-Loss aligns each sample to its specific target domain
+#   - 5 target domains (Full_B30f, Full_B45f, Full_B60f, Quarter_B30f, Quarter_B45f)
+#   - EMA stats mode (fd_ema_beta=0.999 as in official paper)
+#   - --fd-eigvalsh: ~8x faster covariance trace computation
 # ---------------------------------------------------------------
+# Option A: Train from scratch with FD-Loss
 # python train.py \
 #     ${ABLATION_COMMON} \
 #     --master-port        4574 \
 #     --embedding-mode     base_cross_noise \
 #     --noise-feat-dim     20 \
-#     --feat-loss-weight   0.5 \
-#     --feat-loss-interval 1 \
+#     --feat-loss-weight   0.0 \
 #     --dino-model         dinov2_vitb14 \
-#     --align-layer        8 \
-#     --name               step4_i2sb_repa_base_cross_noise_${GPU_NAME} \
-#     --ckpt               step4_i2sb_repa_base_cross_noise_${GPU_NAME} \
-#     --start-itr          180000
+#     --fd-loss-weight     1.0 \
+#     --fd-loss-interval   1 \
+#     --fd-stats-path      data/fd_stats/target_5domains_dinov2b14.npz \
+#     --fd-ema-beta        0.999 \
+#     --fd-eigvalsh \
+#     --fd-norm-eps        0.01 \
+#     --name               step4_i2sb_fd_base_cross_noise_${GPU_NAME}
+
+# Option B: Fine-tune / Resume from Step 3 checkpoint (recommended)
+# python train.py \
+#     ${ABLATION_COMMON} \
+#     --master-port        4574 \
+#     --embedding-mode     base_cross_noise \
+#     --noise-feat-dim     20 \
+#     --feat-loss-weight   0.0 \
+#     --dino-model         dinov2_vitb14 \
+#     --fd-loss-weight     1.0 \
+#     --fd-loss-interval   1 \
+#     --fd-stats-path      data/fd_stats/target_5domains_dinov2b14.npz \
+#     --fd-ema-beta        0.999 \
+#     --fd-eigvalsh \
+#     --fd-norm-eps        0.01 \
+#     --ckpt               step3_i2sb_base_cross_noise_${GPU_NAME} \
+#     --start-itr          200000 \
+#     --num-itr            250000 \
+#     --name               step4_i2sb_fd_base_cross_noise_${GPU_NAME}

@@ -4,7 +4,6 @@ Evaluation script for computing image quality metrics between target and reconst
 Metrics computed:
     - PSNR (Peak Signal-to-Noise Ratio)  — per slice, aggregated per task
     - SSIM (Structural Similarity Index)  — per slice, aggregated per task
-    - LPIPS (Learned Perceptual Image Patch Similarity) — per slice, aggregated per task
     - FID (Frechet Inception Distance) — per task (all slices pooled)
     - FRD (Frechet Radiomics Distance) — per task (all slices pooled)
 
@@ -37,9 +36,6 @@ from torchvision.models import inception_v3
 from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from skimage.metrics import structural_similarity as compute_ssim
 
-# Perceptual metric
-import lpips
-
 from scipy.linalg import sqrtm
 from frd_score import compute_frd
 
@@ -51,16 +47,6 @@ def load_image_np(path):
     """Load an image file and return it as a numpy array normalized to [0, 1] (grayscale)."""
     img = Image.open(path).convert("L")
     return np.array(img).astype(np.float64) / 255.0
-
-
-def load_image_tensor(path, device="cpu"):
-    """Load an image file and return it as a torch tensor for LPIPS ([-1, 1] range, 3-channel)."""
-    img = Image.open(path).convert("RGB")
-    transform = transforms.Compose([
-        transforms.ToTensor(),           # [0, 1]
-        transforms.Normalize(0.5, 0.5),  # [-1, 1]
-    ])
-    return transform(img).unsqueeze(0).to(device)
 
 
 # ============================================================================
@@ -133,6 +119,7 @@ def compute_fid(features_real, features_fake):
 # Main evaluation pipeline
 # ============================================================================
 def evaluate(args):
+    print(f"Experiment Name: {args.experiment_name}")
     base_path = os.path.join(args.results_dir, args.experiment_name, args.samples_dir)
     
     if not os.path.isdir(base_path):
@@ -140,10 +127,6 @@ def evaluate(args):
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
-    
-    # Initialize LPIPS model (AlexNet backbone)
-    lpips_model = lpips.LPIPS(net="alex").to(device)
-    lpips_model.eval()
     
     # Initialize Inception feature extractor for FID
     print("[INFO] Loading Inception v3 for FID computation...")
@@ -159,7 +142,7 @@ def evaluate(args):
     print(f"[INFO] Found {len(task_dirs)} tasks: {task_dirs}")
     
     # Storage for results
-    all_slice_records = []  # Per-slice PSNR, SSIM, LPIPS
+    all_slice_records = []  # Per-slice PSNR, SSIM
     all_task_records = []   # Per-task aggregated metrics
     
     for task_name in task_dirs:
@@ -184,7 +167,6 @@ def evaluate(args):
         task_recon_paths = []
         task_psnr_list = []
         task_ssim_list = []
-        task_lpips_list = []
         
         for group_name in group_dirs:
             group_path = os.path.join(task_path, group_name)
@@ -211,12 +193,6 @@ def evaluate(args):
                     psnr_val = compute_psnr(img_target, img_recon, data_range=1.0)
                     ssim_val = compute_ssim(img_target, img_recon, data_range=1.0)
                     
-                    # --- LPIPS (torch, RGB, [-1, 1]) ---
-                    tensor_target = load_image_tensor(target_file, device)
-                    tensor_recon = load_image_tensor(recon_file, device)
-                    with torch.no_grad():
-                        lpips_val = lpips_model(tensor_target, tensor_recon).item()
-                    
                     # Record slice-level metrics
                     all_slice_records.append({
                         "task": task_name,
@@ -225,12 +201,10 @@ def evaluate(args):
                         "slice_id": slice_id,
                         "psnr": psnr_val,
                         "ssim": ssim_val,
-                        "lpips": lpips_val,
                     })
                     
                     task_psnr_list.append(psnr_val)
                     task_ssim_list.append(ssim_val)
-                    task_lpips_list.append(lpips_val)
                     task_source_paths.append(os.path.join(patient_path, f"{slice_id}_source.png"))
                     task_target_paths.append(target_file)
                     task_recon_paths.append(recon_file)
@@ -260,15 +234,12 @@ def evaluate(args):
             "psnr_std": np.std(task_psnr_list),
             "ssim_mean": np.mean(task_ssim_list),
             "ssim_std": np.std(task_ssim_list),
-            "lpips_mean": np.mean(task_lpips_list),
-            "lpips_std": np.std(task_lpips_list),
             "fid": task_fid,
             "frd": task_frd,
         })
         
         print(f"  [RESULT] PSNR={np.mean(task_psnr_list):.3f}±{np.std(task_psnr_list):.3f}  "
               f"SSIM={np.mean(task_ssim_list):.3f}±{np.std(task_ssim_list):.3f}  "
-              f"LPIPS={np.mean(task_lpips_list):.3f}±{np.std(task_lpips_list):.3f}  "
               f"FID={task_fid:.3f}  FRD={task_frd:.3f}")
               
         # --- Qualitative Visual Inspection (Save Grid) ---
@@ -350,7 +321,7 @@ def evaluate(args):
     output_dir = os.path.join(base_path, "evaluation_results")
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Slice-level results (per-slice PSNR, SSIM, LPIPS)
+    # 1. Slice-level results (per-slice PSNR, SSIM)
     df_slice = pd.DataFrame(all_slice_records)
     slice_csv = os.path.join(output_dir, "metrics_slice_level.csv")
     df_slice.to_csv(slice_csv, index=False)
@@ -365,17 +336,16 @@ def evaluate(args):
     # ========================================================================
     # Print summary table
     # ========================================================================
-    print(f"\n{'='*130}")
+    print(f"\n{'='*105}")
     print("SUMMARY (Slice-level mean ± std, Task-level FID & FRD)")
-    print(f"{'='*130}")
-    print(f"{'Task':<35} {'#Slices':>8} {'PSNR':>18} {'SSIM':>18} {'LPIPS':>18} {'FID':>10} {'FRD':>10}")
-    print(f"{'-'*130}")
+    print(f"{'='*105}")
+    print(f"{'Task':<35} {'#Slices':>8} {'PSNR':>18} {'SSIM':>18} {'FID':>10} {'FRD':>10}")
+    print(f"{'-'*105}")
     for rec in all_task_records:
         print(f"{rec['task']:<35} "
               f"{rec['num_slices']:>8d} "
               f"{rec['psnr_mean']:>8.3f}±{rec['psnr_std']:<8.3f} "
               f"{rec['ssim_mean']:>8.3f}±{rec['ssim_std']:<8.3f} "
-              f"{rec['lpips_mean']:>8.3f}±{rec['lpips_std']:<8.3f} "
               f"{rec['fid']:>10.3f} "
               f"{rec['frd']:>10.3f}")
     
@@ -388,7 +358,7 @@ def evaluate(args):
 # ============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Evaluate image quality metrics (PSNR, SSIM, LPIPS, FID, FRD)"
+        description="Evaluate image quality metrics (PSNR, SSIM, FID, FRD)"
     )
     parser.add_argument("--results_dir", type=str, default="results",
                         help="Root results directory")

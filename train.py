@@ -92,8 +92,24 @@ def create_training_options():
     # --------------- REPA feature alignment loss ---------------
     parser.add_argument("--feat-loss-weight",   type=float, default=0.5,                help="Weight for REPA feature alignment loss. Set 0 to disable.")
     parser.add_argument("--feat-loss-interval", type=int,   default=1,                  help="Compute feature loss every N iterations.")
-    parser.add_argument("--dino-model",         type=str,   default="dinov2_vitl14",    help="DINOv2 model variant.")
+    parser.add_argument("--dino-model",         type=str,   default="dinov2_vitb14",    help="DINOv2 model variant (shared by REPA and FD-Loss).")
     parser.add_argument("--align-layer",        type=int,   default=8,                  help="Patch block layer index (1-based) for REPA alignment.")
+
+    # --------------- FD-Loss: distribution matching in DINOv2 feature space ---------------
+    parser.add_argument("--fd-loss-weight",     type=float, default=0.0,
+                        help="Weight for FD-Loss (Fréchet Distance distribution matching). Set 0 to disable.")
+    parser.add_argument("--fd-loss-interval",   type=int,   default=1,
+                        help="Compute FD-Loss every N iterations (default: 1).")
+    parser.add_argument("--fd-stats-path",      type=str,   default=None,
+                        help="Path to reference statistics .npz (computed by compute_fd_stats.py). Required when --fd-loss-weight > 0.")
+    parser.add_argument("--fd-queue-size",      type=int,   default=5000,
+                        help="Feature queue size for FD covariance estimation when fd_ema_beta=0 (default: 5000).")
+    parser.add_argument("--fd-ema-beta",        type=float, default=0.999,
+                        help="EMA decay for FD stats (default: 0.999 as in FD-Loss paper; set 0.0 to use queue).")
+    parser.add_argument("--fd-eigvalsh",        action="store_true",
+                        help="Use fast eigvalsh mode (~8x faster); requires precomputing σ_ref^{1/2}.")
+    parser.add_argument("--fd-norm-eps",        type=float, default=0.01,
+                        help="Epsilon for FD-Loss normalisation: loss = FD / (FD + eps) → [0, 1) (default: 0.01).")
 
     # --------------- optimizer and loss ---------------
     parser.add_argument("--batch-size",         type=int,   default=16)

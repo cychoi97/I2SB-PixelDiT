@@ -18,6 +18,15 @@ import distributed_util as dist_util
 from . import util
 from .network import PixDiTNet
 from .diffusion import Diffusion
+from .fd_loss import (
+    FeatureQueue,
+    MultiDomainFeatureQueue,
+    compute_frechet_distance_loss,
+    load_fd_reference_stats,
+    precompute_sigma_ref_sqrt,
+    DEFAULT_TARGET_DOMAINS,
+    DEFAULT_TARGET_DOMAIN_KEYS,
+)
 from dataset.dataset import (
     DOSE_ATTRS,
     KERNEL_ATTRS,
@@ -419,7 +428,10 @@ class Runner(object):
         self.repa_proj = None
         self.align_layer = getattr(opt, 'align_layer', 8)
         feat_w = getattr(opt, 'feat_loss_weight', 0.0)
-        if feat_w > 0.0:
+        fd_w   = getattr(opt, 'fd_loss_weight',   0.0)
+
+        # DINOv2 is shared by REPA and FD-Loss — load once if either is active.
+        if feat_w > 0.0 or fd_w > 0.0:
             dino_model = getattr(opt, 'dino_model', 'dinov2_vitb14')
             base_patch_size = getattr(opt, 'patch_size', 16)
             # DINOv2 ViT-B/14 → 768, ViT-L/14 → 1024, ViT-g/14 → 1536
@@ -431,21 +443,115 @@ class Runner(object):
                     model_name=dino_model, base_patch_size=base_patch_size,
                 )
                 self.dino.to(opt.device)
-                self.repa_proj = REPAProjector(
-                    denoiser_dim=denoiser_dim,
-                    hidden_dim=256,
-                    encoder_dim=encoder_dim,
-                )
-                self.repa_proj.to(opt.device)
-                log.info(
-                    f"[REPA] Loaded frozen {dino_model} + projector "
-                    f"(align_layer={self.align_layer}, weight={feat_w}, "
-                    f"denoiser_dim={denoiser_dim}→encoder_dim={encoder_dim})"
-                )
+                if feat_w > 0.0:
+                    self.repa_proj = REPAProjector(
+                        denoiser_dim=denoiser_dim,
+                        hidden_dim=256,
+                        encoder_dim=encoder_dim,
+                    )
+                    self.repa_proj.to(opt.device)
+                    log.info(
+                        f"[REPA] Loaded frozen {dino_model} + projector "
+                        f"(align_layer={self.align_layer}, weight={feat_w}, "
+                        f"denoiser_dim={denoiser_dim}→encoder_dim={encoder_dim})"
+                    )
+                else:
+                    log.info(
+                        f"[DINOv2] Loaded frozen {dino_model} for FD-Loss "
+                        f"(feat_dim={encoder_dim})"
+                    )
             except Exception as e:
-                log.warning(f"[REPA] Failed to init: {e}. Feature loss disabled.")
+                log.warning(f"[REPA/FD] Failed to init DINOv2: {e}. Feature losses disabled.")
                 self.dino = None
                 self.repa_proj = None
+
+        # ------------------------------------------------------------------
+        # FD-Loss: FeatureQueue + reference statistics
+        # ------------------------------------------------------------------
+        self.fd_queue          = None
+        self.fd_mu_ref         = None
+        self.fd_sigma_ref      = None
+        self.fd_ref_stats      = None
+        self.fd_sigma_ref_sqrt = None
+        self.is_multi_fd       = False
+
+        if fd_w > 0.0:
+            fd_stats_path = getattr(opt, 'fd_stats_path', None)
+            fd_queue_size = getattr(opt, 'fd_queue_size', 5000)
+            fd_ema_beta   = getattr(opt, 'fd_ema_beta', 0.999)
+            dino_model    = getattr(opt, 'dino_model', 'dinov2_vitb14')
+            fd_feat_dim   = {'dinov2_vitb14': 768, 'dinov2_vitl14': 1024,
+                             'dinov2_vitg14': 1536}.get(dino_model, 768)
+
+            if fd_stats_path is None:
+                log.warning(
+                    "[FD-Loss] fd_loss_weight > 0 but --fd-stats-path not provided. "
+                    "FD-Loss will be disabled."
+                )
+            elif self.dino is None:
+                log.warning(
+                    "[FD-Loss] DINOv2 not loaded. FD-Loss will be disabled."
+                )
+            else:
+                ref_stats = load_fd_reference_stats(
+                    fd_stats_path, device=opt.device
+                )
+
+                if isinstance(ref_stats, dict):
+                    # Multi-domain target-conditioned mode
+                    self.is_multi_fd = True
+                    self.fd_ref_stats = ref_stats
+                    domain_keys = list(ref_stats.keys())
+                    self.fd_queue = MultiDomainFeatureQueue(
+                        domain_keys=domain_keys,
+                        size=fd_queue_size,
+                        feat_dim=fd_feat_dim,
+                        online_accum=True,
+                        ema_beta=fd_ema_beta,
+                    ).to(opt.device)
+
+                    if getattr(opt, 'fd_eigvalsh', False):
+                        self.fd_sigma_ref_sqrt = precompute_sigma_ref_sqrt(
+                            self.fd_ref_stats
+                        )
+                        log.info(
+                            f"[FD-Loss] Precomputed σ_ref^{{1/2}} for {len(self.fd_ref_stats)} target domains."
+                        )
+                    log.info(
+                        f"[FD-Loss] Initialized Target-Conditioned MultiDomainFeatureQueue: "
+                        f"domains={domain_keys}, ema_beta={fd_ema_beta}, feat_dim={fd_feat_dim}"
+                    )
+                else:
+                    # Single-domain fallback mode
+                    self.is_multi_fd = False
+                    self.fd_mu_ref, self.fd_sigma_ref = ref_stats
+                    self.fd_queue = FeatureQueue(
+                        size=fd_queue_size,
+                        feat_dim=fd_feat_dim,
+                        online_accum=True,
+                        ema_beta=fd_ema_beta,
+                    ).to(opt.device)
+
+                    if getattr(opt, 'fd_eigvalsh', False):
+                        self.fd_sigma_ref_sqrt = precompute_sigma_ref_sqrt(
+                            self.fd_sigma_ref
+                        )
+                        log.info("[FD-Loss] Precomputed σ_ref^{1/2} for single-domain mode.")
+                    log.info(
+                        f"[FD-Loss] Initialized single-domain FeatureQueue: "
+                        f"ema_beta={fd_ema_beta}, feat_dim={fd_feat_dim}"
+                    )
+
+                # Restore queue state from checkpoint if available
+                if opt.load:
+                    checkpoint = torch.load(opt.load, map_location="cpu")
+                    if "fd_queue" in checkpoint:
+                        try:
+                            self.fd_queue.load_state_dict(checkpoint["fd_queue"])
+                            self.fd_queue.to(opt.device)
+                            log.info("[FD-Loss] Restored FeatureQueue state from checkpoint.")
+                        except Exception as e:
+                            log.warning(f"[FD-Loss] Could not restore fd_queue from checkpoint ({e}).")
 
     # ------------------------------------------------------------------
     # Label computation
@@ -462,6 +568,47 @@ class Runner(object):
         if clip_denoise:
             pred_x0.clamp_(-1., 1.)
         return pred_x0
+
+    # ------------------------------------------------------------------
+    # FD-Loss helper: DINOv2 CLS-token extraction with gradient support
+    # ------------------------------------------------------------------
+
+    def _extract_fd_features(self, x_01: torch.Tensor) -> torch.Tensor:
+        """Extract DINOv2 CLS-token features while preserving gradients.
+
+        Unlike DINOv2Encoder.forward() (which is decorated with @torch.no_grad),
+        this method directly calls the underlying encoder so that gradients
+        can flow from the FD loss back through the predicted x0 to the network.
+        DINOv2 parameters remain frozen (requires_grad=False); only the
+        activations carry gradients.
+
+        Args:
+            x_01: [B, 1 or 3, H, W] float32 in [0, 1].
+
+        Returns:
+            [B, feat_dim] float32 CLS-token feature tensor (with grad).
+        """
+        # Ensure 3-channel input for DINOv2
+        if x_01.shape[1] == 1:
+            x_01 = x_01.repeat(1, 3, 1, 1)
+
+        dino_enc = self.dino
+        b, c, h, w = x_01.shape
+
+        # Resize: each base_patch_size pixel → 14 DINOv2 pixels
+        target_h = int(14 * h / dino_enc.base_patch_size)
+        target_w = int(14 * w / dino_enc.base_patch_size)
+        x_resized = F.interpolate(
+            x_01, (target_h, target_w), mode="bicubic", align_corners=False
+        )
+
+        # ImageNet normalization (same as DINOv2Encoder)
+        x_norm = (x_resized - dino_enc.mean.to(x_resized)) / dino_enc.std.to(x_resized)
+
+        # Forward through encoder WITHOUT @torch.no_grad() — gradients preserved
+        feats = dino_enc.encoder.forward_features(x_norm)
+        cls_feat = feats["x_norm_clstoken"].to(torch.float32)  # [B, feat_dim]
+        return cls_feat
 
     # ------------------------------------------------------------------
     # Batch sampling
@@ -604,8 +751,68 @@ class Runner(object):
                         cos_sim = F.cosine_similarity(proj_feat, dst_feat, dim=-1)
                         loss_feat = (1.0 - cos_sim).mean()
 
-                loss = loss_diff + feat_w * loss_feat
+                # ===== FD-Loss: distribution matching in DINOv2 CLS-token space =====
+                loss_fd = torch.tensor(0.0, device=opt.device)
+                fd_w_cur        = getattr(opt, 'fd_loss_weight',   0.0)
+                fd_interval_cur = getattr(opt, 'fd_loss_interval', 1)
+                fd_norm_eps     = getattr(opt, 'fd_norm_eps',       0.01)
+
+                if (self.fd_queue is not None
+                        and fd_w_cur > 0.0
+                        and it % fd_interval_cur == 0):
+
+                    # Compute predicted x0 (restored CT image) from current step.
+                    # pred_x0 carries gradients via pred → net → model parameters.
+                    pred_x0 = self.compute_pred_x0(
+                        step, xt, pred.detach() if not xt.requires_grad else pred,
+                        clip_denoise=opt.clip_denoise,
+                    )
+                    # Re-derive pred_x0 with gradient from pred
+                    std_fwd = self.diffusion.get_std_fwd(step, xdim=xt.shape[1:])
+                    pred_x0_grad = xt.detach() - std_fwd * pred  # gradient through pred
+                    if opt.clip_denoise:
+                        # clamp preserves gradient (straight-through-style)
+                        pred_x0_grad = pred_x0_grad.clamp(-1.0, 1.0)
+
+                    # Convert [-1, 1] → [0, 1] for DINOv2
+                    pred_x0_01 = (pred_x0_grad + 1.0) / 2.0
+
+                    # Extract DINOv2 CLS features WITH gradient flow
+                    cls_feat = self._extract_fd_features(pred_x0_01)  # [B, D]
+
+                    if getattr(self, 'is_multi_fd', False):
+                        sample_domain_keys = [
+                            f"{DOSE_ID_TO_NAME[int(td)]}_{KERNEL_ID_TO_NAME[int(tk)]}"
+                            for td, tk in zip(trg_dose.cpu(), trg_kernel.cpu())
+                        ]
+                        loss_fd, _ = self.fd_queue.compute_target_fd_loss(
+                            cls_feat=cls_feat,
+                            sample_domain_keys=sample_domain_keys,
+                            ref_stats=self.fd_ref_stats,
+                            ref_sigma_sqrt=self.fd_sigma_ref_sqrt,
+                            norm_eps=fd_norm_eps,
+                        )
+                    else:
+                        # Single-domain fallback
+                        mu_gen, sigma_gen = self.fd_queue.build_feats_stats(cls_feat)
+                        loss_fd_raw = compute_frechet_distance_loss(
+                            self.fd_mu_ref, self.fd_sigma_ref,
+                            mu=mu_gen, sigma=sigma_gen,
+                            sigma_ref_sqrt=self.fd_sigma_ref_sqrt,
+                        )
+                        loss_fd = loss_fd_raw / (loss_fd_raw.detach() + fd_norm_eps)
+
+                loss = loss_diff + feat_w * loss_feat + fd_w_cur * loss_fd
                 loss.backward()
+
+                # Update FD queue with detached features AFTER backward
+                if (self.fd_queue is not None
+                        and fd_w_cur > 0.0
+                        and it % fd_interval_cur == 0):
+                    if getattr(self, 'is_multi_fd', False):
+                        self.fd_queue.enqueue(cls_feat.detach(), sample_domain_keys)
+                    else:
+                        self.fd_queue.enqueue(cls_feat.detach())
 
             optimizer.step()
             ema.update()
@@ -616,12 +823,13 @@ class Runner(object):
             vram_alloc = torch.cuda.memory_allocated(opt.device) / (1024 ** 3)
             vram_reserved = torch.cuda.memory_reserved(opt.device) / (1024 ** 3)
             log.info(
-                "train_it {}/{} | lr:{} | loss_diff:{} | loss_feat:{} | loss:{} | VRAM:{:.2f}GB (reserved:{:.2f}GB)".format(
+                "train_it {}/{} | lr:{} | loss_diff:{} | loss_feat:{} | loss_fd:{} | loss:{} | VRAM:{:.2f}GB (reserved:{:.2f}GB)".format(
                     1 + it,
                     opt.num_itr,
                     "{:.2e}".format(optimizer.param_groups[0]['lr']),
                     "{:+.4f}".format(loss_diff.item()),
                     "{:+.4f}".format(loss_feat.item()),
+                    "{:+.4f}".format(loss_fd.item()),
                     "{:+.4f}".format(loss.item()),
                     vram_alloc,
                     vram_reserved,
@@ -631,6 +839,7 @@ class Runner(object):
                 self.writer.add_scalar(it, 'loss/total', loss.detach())
                 self.writer.add_scalar(it, 'loss/diff',  loss_diff.detach())
                 self.writer.add_scalar(it, 'loss/feat',  loss_feat.detach())
+                self.writer.add_scalar(it, 'loss/fd',    loss_fd.detach())
 
             if it % 5000 == 0 or it == opt.num_itr:
                 if opt.global_rank == 0:
@@ -642,6 +851,9 @@ class Runner(object):
                     }
                     if self.repa_proj is not None:
                         ckpt_dict["repa_proj"] = self.repa_proj.state_dict()
+                    # Save FD queue state for warm-restart
+                    if self.fd_queue is not None:
+                        ckpt_dict["fd_queue"] = self.fd_queue.state_dict()
                     torch.save(ckpt_dict, opt.ckpt_path / f"{it:07}.pt")
                     log.info(f"Saved latest(it={it}) checkpoint to {opt.ckpt_path}!")
                 if opt.distributed:
