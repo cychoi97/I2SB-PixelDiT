@@ -160,7 +160,7 @@ The ablation study isolates the contribution of each architectural innovation sy
 | **Step 1** | PixelDiT-Large | `base` | $\mathcal{L}_{I2SB}$ | Baseline multi-domain model with independent dose & kernel table embeddings |
 | **Step 2** | PixelDiT-Large | `base_cross` | $\mathcal{L}_{I2SB}$ | Adds pairwise `(dose × kernel)` cross-domain interaction embeddings |
 | **Step 3** | PixelDiT-Large | `base_cross_noise` | $\mathcal{L}_{I2SB}$ | Adds Haar-wavelet noise statistics vector (20-dim) to condition on degradation level |
-| **Step 4** | PixelDiT-Large | `base_cross_noise` | $\mathcal{L}_{I2SB} + \lambda_{FD} \mathcal{L}_{FD}$ | Adds Target-Conditioned FD-Loss across 5 target domains (EMA mode, `--fd-eigvalsh`) |
+| **Step 4** | PixelDiT-Large | `base_cross_noise` | $\mathcal{L}_{I2SB}$ + $\lambda_{FD}$ $\mathcal{L}_{FD}$ | Adds Target-Conditioned FD-Loss across 5 target domains (EMA mode, `--fd-eigvalsh`) |
 
 ---
 
